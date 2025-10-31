@@ -12,12 +12,13 @@ import random
 import math
 import torch
 import torch.nn as nn
+from einops import rearrange,einsum
 
 # nvtx
 import torch.cuda.nvtx as nvtx
 
 # cs336_basics
-from cs336_basics.module import transformer_lm
+from cs336_basics.module import scaled_dot_product_attention_func
 from cs336_basics.optim import cross_entropy_func, AdamW
 
 # device
@@ -28,6 +29,22 @@ device = torch.device(device_str)
 # cudnn
 torch.backends.cudnn.benchmark = True 
 torch.backends.cudnn.enabled = True 
+
+class self_attention(nn.Module):
+    def __init__(self, d_model: int, 
+                 max_seq_len: int | None=None,  
+                 device: torch.device | None=None, 
+                 dtype: torch.dtype| None=None):
+        super().__init__()
+        self.d_model = d_model
+        self.o_weight = nn.Parameter(torch.empty(self.d_model, self.d_model, dtype=dtype, device=device))
+
+    def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
+        seq_len = Q.shape[-2]
+        pred = scaled_dot_product_attention_func(Q, K, V)
+        # pred = einsum(self.o_weight, pred, "out_dim in_dim, ... seq_len in_dim -> ... seq_len out_dim")
+        return pred
+        # return (mid, pred)
 
 def benchmark(description: str, run: Callable, num_warmups: int = 5, num_trials: int = 3, use_memory_profiling: bool = False):
     """Benchmark `func` by running it `num_trials`, and return all the times."""
@@ -77,49 +94,33 @@ def benchmark(description: str, run: Callable, num_warmups: int = 5, num_trials:
     return times
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='benchmark')
+    parser = argparse.ArgumentParser(description='pytorch_attention')
     parser.add_argument('--auto', type=int, default=0, help='batch eval model')
-    parser.add_argument('--vocab_size', type=int, default=10000, help='vocab_size')
-    parser.add_argument('--batch_size', type=int, default=4, help='batch_size')
+    parser.add_argument('--batch_size', type=int, default=8, help='batch_size')
     parser.add_argument('--seq_len', type=int, default=256, help='seq_len')
-    parser.add_argument('--d_model', type=int, default=1280, help='d_model')
-    parser.add_argument('--d_ff', type=int, default=5120, help='d_ff')
-    parser.add_argument('--num_layers', type=int, default=36, help='num_layers')
-    parser.add_argument('--num_heads', type=int, default=20, help='num_heads')
-    parser.add_argument('--rope_theta', type=int, default=10000, help='rope_theta')
+    parser.add_argument('--d_model', type=int, default=16, help='d_model')
     parser.add_argument('--num_warmups', type=int, default=5, help='num_warmups')
     parser.add_argument('--num_steps', type=int, default=10, help='rope_theta')
-    parser.add_argument('--only_forward', type=bool, default=True, help='only_forward')
+    parser.add_argument('--only_forward', type=bool, default=False, help='only_forward')
     parser.add_argument('--use_mixed_precision', type=bool, default=False, help='use_mixed_precision')
     parser.add_argument('--use_memory_profiling', type=bool, default=False, help='memory_profiling')
     return parser.parse_args()
 
-def build_model(
-    vocab_size: int,
-    context_length: int,
-    d_model: int,
-    num_layers: int,
-    num_heads: int,
-    d_ff: int,
-    rope_theta: float
-):
-    model = transformer_lm(vocab_size, context_length, d_model, num_layers, num_heads, d_ff, rope_theta, device=device)
-    return model
-
 def run_model(
     model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    vocab_size: int,
-    batch_size: int,
-    context_length: int,
-    only_forward: bool,
-    use_mixed_precision: bool
+    batch_size: int = 4,
+    seq_len: int = 256,
+    d_model: int = 512,
+    only_forward: bool = True,
+    use_mixed_precision: bool = False,
+    use_memory_profiling: bool = False
 ) -> Callable:
     times = dict()
     def run():
         # data
-        data = torch.randint(low=0, high=vocab_size, size=(batch_size, context_length), device=device)
-        labels = torch.randint(low=0, high=vocab_size, size=(batch_size, context_length), device=device)
+        Q = torch.rand(batch_size, seq_len, d_model, dtype=torch.float32, device=device, requires_grad=True)
+        K = torch.rand(batch_size, seq_len, d_model, dtype=torch.float32, device=device, requires_grad=True)
+        V = torch.rand(batch_size, seq_len, d_model, dtype=torch.float32, device=device, requires_grad=True)
 
         if use_mixed_precision:
             context_manager = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -128,143 +129,109 @@ def run_model(
 
         # forward
         with context_manager:
+            # pre_forward_allocated = torch.cuda.memory_allocated()
+            # pre_forward_allocated = torch.cuda.max_memory_allocated()
             start_time = default_timer() #time.time() 
             with nvtx.range("forward"):
-                pred = model(data) 
+                pred = model(Q, K, V)
+                # pred = scaled_dot_product_attention_func(Q, K, V)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()  # Wait for CUDA threads to finish (important!)
             end_time = default_timer() #time.time() 
             times['forward'] = (end_time - start_time) * 1000
+
+            # post_forward_allocated = torch.cuda.max_memory_allocated()
+            # times['allocated'] = (post_forward_allocated - pre_forward_allocated) / (1024**2)
     
-            if not only_forward:
+            if (not only_forward) and (not use_memory_profiling):
                 # backward
                 start_time = default_timer() #time.time() 
                 with nvtx.range("backward"):
-                    loss = cross_entropy_func(pred, labels)     
+                    loss = pred.mean()  
                     loss.backward()
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()  # Wait for CUDA threads to finish (important!)
                 end_time = default_timer() #time.time() 
                 times['backward'] = (end_time - start_time) * 1000 
-    
-                # optimizer
-                start_time = default_timer() #time.time() 
-                with nvtx.range("optimizer_step"):
-                    optimizer.step()
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()  # Wait for CUDA threads to finish (important!)
-                end_time = default_timer() #time.time() 
-                times['optimizer'] = (end_time - start_time) * 1000 
             
         return times
         
     return run
 
 def run_benchmark(
-    vocab_size: int = 10000,
     batch_size: int = 4,
     seq_len: int = 256,
     d_model: int = 512,
-    d_ff: int = 1344,
-    num_layers: int = 4,
-    num_heads: int = 16,
-    rope_theta: int = 10000,
     num_warmups: int = 5,
     num_steps: int = 10,
     only_forward: bool = False,
     use_mixed_precision: bool = False,
     use_memory_profiling: bool = False
 ):
-    # Start recording memory history.
-    if use_memory_profiling:
-        torch.cuda.memory._record_memory_history(max_entries=1000000)
-    
-    # model
-    model = build_model(
-        vocab_size,
-        seq_len,
-        d_model,
-        num_layers,
-        num_heads,
-        d_ff,
-        rope_theta
-    )
-    model = torch.compile(model)
-
-    # optimizer
-    optimizer = AdamW(model.parameters())
+    # # Start recording memory history.
+    # if use_memory_profiling:
+    #     torch.cuda.memory._record_memory_history(max_entries=1000000)
     
     # benchmark
+    model = self_attention(d_model, max_seq_len=seq_len, dtype=torch.float32, device=device)
+
+    # torch.compile
+    model = torch.compile(model)
     manual_time = benchmark(
-        "transformer_lm", 
-        run_model(model, optimizer, vocab_size, batch_size, seq_len, only_forward, use_mixed_precision), 
+        "pytorch_attention", 
+        run_model(model, batch_size, seq_len, d_model, only_forward, use_mixed_precision, use_memory_profiling=use_memory_profiling), 
         num_warmups=num_warmups, 
         num_trials=num_steps,
         use_memory_profiling=use_memory_profiling
     )
 
-    # Save a pickle file to be loaded by PyTorch's online tool.
-    if use_memory_profiling:
-        torch.cuda.memory._dump_snapshot("memory_snapshot.pickle")
+    # # Save a pickle file to be loaded by PyTorch's online tool.
+    # if use_memory_profiling:
+    #     torch.cuda.memory._dump_snapshot("memory_snapshot.pickle")
         
-    # Stop recording history.
-    if use_memory_profiling:
-        torch.cuda.memory._record_memory_history(enabled=None)
+    # # Stop recording history.
+    # if use_memory_profiling:
+    #     torch.cuda.memory._record_memory_history(enabled=None)
     return manual_time
 
 
 if __name__ == "__main__":
     args = parse_args()
+    # Start recording memory history.
+    if args.use_memory_profiling:
+        torch.cuda.memory._record_memory_history(max_entries=1000000)
 
     if args.auto:
-        vocab_size = 10000
-        batch_size = 4
-        seq_len    = 256
-        rope_theta  = 10000
+        batch_size = 8
+        d_model_list = [16, 32, 64, 128]
+        seq_len_list = [256, 1024, 4096, 8192, 16384]
+        # d_model_list = [16]
+        # seq_len_list = [256, 1024] #, 4096, 8192] #, 16384]
         num_warmups = 4
-        num_steps  = 10
-        only_forward = False #True
-        use_mixed_precision = False #True # False
-        use_memory_profiling = False
+        num_steps  = 100
+        only_forward = False #True #
+        use_mixed_precision = False
         data = {
-            "size": list(),
             "batch_size": list(),
             "seq_len": list(),
-            "d_model": list(),
-            "d_ff": list(),
-            "num_layers": list(),
-            "num_heads": list()
+            "d_model": list()
         }
         req_key_list = list(data.keys())
-        small  = {"size":"small", "d_model":768,  "d_ff":3072,  "num_layers":12, "num_heads":12}
-        medium = {"size":"medium", "d_model":1024, "d_ff":4096,  "num_layers":24, "num_heads":16}
-        large  = {"size":"large", "d_model":1280, "d_ff":5120,  "num_layers":36, "num_heads":20}
-        xl     = {"size":"xl", "d_model":1600, "d_ff":6400,  "num_layers":48, "num_heads":25}
-        L_27B  = {"size":"2.7B", "d_model":2560, "d_ff":10240, "num_layers":32, "num_heads":32}
-        for model_dict in [small, medium, large, xl, L_27B]:
-            for seq_len in [128, 256, 512, 1024]:
-                data['size'].append(model_dict['size'])
+        for d_model in d_model_list:
+            for seq_len in seq_len_list:
                 data['batch_size'].append(batch_size)
                 data['seq_len'].append(seq_len)
-                data['d_model'].append(model_dict['d_model'])
-                data['d_ff'].append(model_dict['d_ff'])
-                data['num_layers'].append(model_dict['num_layers'])
-                data['num_heads'].append(model_dict['num_heads'])
+                data['d_model'].append(d_model)
                 try:
                     manual_time = run_benchmark(
-                        vocab_size = vocab_size,
                         batch_size = batch_size,
                         seq_len = seq_len,
-                        d_model = model_dict['d_model'],
-                        d_ff = model_dict['d_ff'],
-                        num_layers = model_dict['num_layers'],
-                        num_heads = model_dict['num_heads'],
-                        rope_theta = rope_theta,
+                        d_model = d_model,
                         num_warmups = num_warmups,
                         num_steps = num_steps,
                         only_forward = only_forward,
                         use_mixed_precision = use_mixed_precision,
-                        use_memory_profiling = use_memory_profiling
+                        use_memory_profiling = args.use_memory_profiling
                     )
                     for key_name in manual_time.keys():
                         if '_' not in key_name:
@@ -284,14 +251,9 @@ if __name__ == "__main__":
 
     else:    
         manual_time = run_benchmark(
-            vocab_size = args.vocab_size,
             batch_size = args.batch_size,
             seq_len = args.seq_len,
             d_model = args.d_model,
-            d_ff = args.d_ff,
-            num_layers = args.num_layers,
-            num_heads = args.num_heads,
-            rope_theta = args.rope_theta,
             num_warmups = args.num_warmups,
             num_steps = args.num_steps,
             only_forward = args.only_forward,
@@ -299,6 +261,14 @@ if __name__ == "__main__":
             use_memory_profiling = args.use_memory_profiling
         )
         print(manual_time)
+
+    # Save a pickle file to be loaded by PyTorch's online tool.
+    if args.use_memory_profiling:
+        torch.cuda.memory._dump_snapshot("memory_snapshot.pickle")
+        
+    # Stop recording history.
+    if args.use_memory_profiling:
+        torch.cuda.memory._record_memory_history(enabled=None)
     
 
     
