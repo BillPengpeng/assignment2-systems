@@ -23,6 +23,7 @@ import torch.cuda.nvtx as nvtx
 # cs336_basics
 from cs336_basics.module import scaled_dot_product_attention_func
 from cs336_basics.optim import cross_entropy_func, AdamW
+from cs336_systems.pytorch_attention import pytorch_flashattention_backward
 
 # device
 from contextlib import nullcontext
@@ -159,7 +160,7 @@ def causal_flash_fwd_kernel(
 
 @triton.jit
 def flash_fwd_kernel(
-    Q_ptr, K_ptr, V_ptr,
+    Q_ptr, K_ptr, V_ptr, mask_ptr,
     O_ptr, L_ptr,
     stride_qb, stride_qq, stride_qd,
     stride_kb, stride_kk, stride_kd,
@@ -171,6 +172,7 @@ def flash_fwd_kernel(
     D: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
+    is_causal: tl.constexpr
 ):
     # Program indices
     query_tile_index = tl.program_id(0)
@@ -218,6 +220,14 @@ def flash_fwd_kernel(
         block_shape=(Q_TILE_SIZE, ),
         order=(0, ),
     )
+    Mask_block_ptr = tl.make_block_ptr(
+        mask_ptr,
+        shape=(N_QUERIES, N_KEYS),
+        strides=(N_KEYS, 1),
+        offsets=(query_tile_index * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, K_TILE_SIZE),
+        order=(1, 0),
+    )
 
     # 临时变量
     L_i = tl.full((Q_TILE_SIZE,), 0, tl.float32)
@@ -226,6 +236,7 @@ def flash_fwd_kernel(
 
     # 计算循环
     Q_data = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
+    QK_inf = tl.full((Q_TILE_SIZE, K_TILE_SIZE), -1e6, tl.float32)
     for k_offset in range(0, N_KEYS, K_TILE_SIZE):
         K_data = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
         V_data = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
@@ -233,6 +244,12 @@ def flash_fwd_kernel(
         # S_ij = einsum(Q_i, K_j, "B Bq d, B Bk d -> B Bq Bk") / math.sqrt(d)
         K_data = tl.trans(K_data)
         S_ij = tl.dot(Q_data, K_data) * scale
+
+        # mask
+        if is_causal:
+            Mask_data = tl.load(Mask_block_ptr, boundary_check=(0, 1), padding_option="zero")
+            S_ij = tl.where(Mask_data, S_ij, QK_inf)
+            Mask_block_ptr = tl.advance(Mask_block_ptr, (0, K_TILE_SIZE))
 
         # S_ij_max, _ = torch.max(S_ij, dim=-1)
         # M_i_new = torch.maximum(M_i_prev, S_ij_max)
@@ -280,51 +297,55 @@ class trion_flashattention(torch.autograd.Function):
         L = torch.zeros((B, N_QUERIES,), dtype=torch.float32, device=Q.device)
         O = torch.zeros((B, N_QUERIES, D), dtype=torch.float32, device=Q.device)
 
-        if is_causal:
-            # 应用因果掩码
-            mask = torch.tril(torch.ones(N_QUERIES, N_KEYS, dtype=torch.float32, device=Q.device))
-            # print(mask)
+        # if is_causal:
+        #     # 应用因果掩码
+        mask = torch.tril(torch.ones(N_QUERIES, N_KEYS, dtype=torch.float32, device=Q.device))
+        # print(mask)
         
         # 上下文保存
-        ctx.save_for_backward(L)
+        ctx.is_causal = is_causal
+        # ctx.save_for_backward(L)
 
         # call flash_fwd_kernel
-        if is_causal:
-            causal_flash_fwd_kernel[(triton.cdiv(N_QUERIES, Q_TILE_SIZE), B)](
-                Q, K, V, mask,
-                O, L,
-                N_QUERIES * D, D, 1,
-                N_KEYS * D, D, 1,
-                N_KEYS * D, D, 1,
-                N_QUERIES * N_KEYS, N_KEYS, 1,
-                N_QUERIES * D, D, 1,
-                N_QUERIES, 1, 
-                N_QUERIES, N_KEYS,
-                1.0 / math.sqrt(D),
-                D,
-                Q_TILE_SIZE,
-                K_TILE_SIZE
-            )
-        else:
-            flash_fwd_kernel[(triton.cdiv(N_QUERIES, Q_TILE_SIZE), B)](
-                Q, K, V,
-                O, L,
-                N_QUERIES * D, D, 1,
-                N_KEYS * D, D, 1,
-                N_KEYS * D, D, 1,
-                N_QUERIES * D, D, 1,
-                N_QUERIES, 1, 
-                N_QUERIES, N_KEYS,
-                1.0 / math.sqrt(D),
-                D,
-                Q_TILE_SIZE,
-                K_TILE_SIZE
-            )
+        # if is_causal:
+        #     causal_flash_fwd_kernel[(triton.cdiv(N_QUERIES, Q_TILE_SIZE), B)](
+        #         Q, K, V, mask,
+        #         O, L,
+        #         N_QUERIES * D, D, 1,
+        #         N_KEYS * D, D, 1,
+        #         N_KEYS * D, D, 1,
+        #         N_QUERIES * N_KEYS, N_KEYS, 1,
+        #         N_QUERIES * D, D, 1,
+        #         N_QUERIES, 1, 
+        #         N_QUERIES, N_KEYS,
+        #         1.0 / math.sqrt(D),
+        #         D,
+        #         Q_TILE_SIZE,
+        #         K_TILE_SIZE
+        #     )
+        # else:
+        flash_fwd_kernel[(triton.cdiv(N_QUERIES, Q_TILE_SIZE), B)](
+            Q, K, V, mask,
+            O, L,
+            N_QUERIES * D, D, 1,
+            N_KEYS * D, D, 1,
+            N_KEYS * D, D, 1,
+            N_QUERIES * D, D, 1,
+            N_QUERIES, 1, 
+            N_QUERIES, N_KEYS,
+            1.0 / math.sqrt(D),
+            D,
+            Q_TILE_SIZE,
+            K_TILE_SIZE,
+            is_causal
+        )
         # print(O[0, :3, :16])
+        ctx.save_for_backward(Q, K, V, O, L)
         return O
                 
     @staticmethod
     def backward(ctx, grad_out):
-        raise NotImplementedError
+        # raise NotImplementedError
+        return pytorch_flashattention_backward(ctx, grad_out)
         
 
