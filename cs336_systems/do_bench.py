@@ -86,7 +86,7 @@ def run_backward(model, batch_size, n_queries, n_keys, D) -> Callable:
 def test_timing_flash_forward_backward():
     n_heads = 16
     d_head = 64
-    sequence_length = 8192 #16384
+    sequence_length = 1024 #8192 #16384
     q, k, v = torch.randn(3, n_heads, sequence_length, d_head, device='cuda', dtype=torch.bfloat16, requires_grad=True)
     # print(q.shape, k.shape, v.shape)
     flash = triton_flashattention.apply
